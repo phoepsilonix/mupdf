@@ -132,6 +132,11 @@ ifeq ($(HAVE_OBJCOPY),yes)
 	$(CC_CMD) $(WARNING_CFLAGS) -Wdeclaration-after-statement -DHAVE_OBJCOPY $(LIB_CFLAGS) $(THIRD_CFLAGS)
   $(OUT)/source/fitz/hyphen.o : source/fitz/hyphen.c
 	$(CC_CMD) $(WARNING_CFLAGS) -Wdeclaration-after-statement -DHAVE_OBJCOPY $(LIB_CFLAGS) $(THIRD_CFLAGS)
+else
+  $(OUT)/source/fitz/noto.o : source/fitz/noto.c
+	$(CC_CMD) $(WARNING_CFLAGS) -Wdeclaration-after-statement $(LIB_CFLAGS) $(THIRD_CFLAGS) -UHAVE_OBJCOPY
+  $(OUT)/source/fitz/hyphen.o : source/fitz/hyphen.c
+	$(CC_CMD) $(WARNING_CFLAGS) -Wdeclaration-after-statement $(LIB_CFLAGS) $(THIRD_CFLAGS) -UHAVE_OBJCOPY
 endif
 
 $(OUT)/source/fitz/memento.o : source/fitz/memento.c
@@ -242,7 +247,12 @@ ifneq ($(filter -DTOFU_SIL,$(CFLAGS)),)
   FONT_BIN := $(filter-out resources/fonts/sil/%.cff,$(FONT_BIN))
 endif
 
+ifeq ($(HAVE_OBJCOPY),yes)
 FONT_GEN := $(FONT_BIN:%=generated/%.c)
+else
+FONT_GEN := $(wildcard generated/resources/fonts/**/*.c)
+FONT_BIN :=
+endif
 
 generated/%.cff.c : %.cff $(HEXDUMP_SH) ; $(QUIET_GEN) $(MKTGTDIR) ; bash $(HEXDUMP_SH) > $@ $<
 generated/%.otf.c : %.otf $(HEXDUMP_SH) ; $(QUIET_GEN) $(MKTGTDIR) ; bash $(HEXDUMP_SH) > $@ $<
@@ -703,3 +713,17 @@ endif
 .PHONY: shared shared-debug shared-clean
 .PHONY: c++-% python-% csharp-%
 .PHONY: c++-clean python-clean csharp-clean
+resources/%: ;
+	@true
+
+resources/hyphen/%: ;
+	@true
+
+resources/fonts/%: ;
+	@true
+
+resources/hyphen/%.o: ;
+	@true
+
+resources/fonts/%.o: ;
+	@true
