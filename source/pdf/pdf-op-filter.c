@@ -123,6 +123,11 @@ typedef struct
 	pdf_text_object_state tos;
 	fz_matrix sent_tlm;
 	fz_matrix sent_tm;
+	/* Set when a text positioning operator (Td, TD, Tm, T-star, quote or
+	 * double quote) moved the text position away from where the text output
+	 * so far left it, even if the line matrix itself did not change (e.g.
+	 * "0 0 Td" after some text on the same line). */
+	int tm_reset_pending;
 	float Tm_adjust;
 	int BT_pending;
 	int in_BT;
@@ -138,6 +143,28 @@ typedef struct
 	pdf_filter_options *global_options;
 	fz_path *path;
 } pdf_sanitize_processor;
+
+static int
+filter_matrix_equal(fz_matrix a, fz_matrix b)
+{
+	return a.a == b.a && a.b == b.b && a.c == b.c &&
+		a.d == b.d && a.e == b.e && a.f == b.f;
+}
+
+/* Td, TD, Tm, T-star, quote and double quote all set the text matrix to a
+ * new line matrix.
+ * If that moves the text position from where the text that has already been
+ * shown left it, remember it. filter_flush only sends a positioning operator
+ * when the line matrix differs from the one last sent, so without this a
+ * reset that leaves the line matrix unchanged (e.g. "0 0 Td" after a run of
+ * text on the same line) was dropped, and the following text was shown at the
+ * advanced position instead of at the start of the line. */
+static void
+filter_note_text_reset(pdf_sanitize_processor *p, fz_matrix tm_before)
+{
+	if (!filter_matrix_equal(tm_before, p->tos.tm))
+		p->tm_reset_pending = 1;
+}
 
 static void
 copy_resource(fz_context *ctx, pdf_sanitize_processor *p, pdf_obj *key, const char *name)
@@ -586,7 +613,8 @@ done_SC:
 				p->tos.tlm.c != p->sent_tlm.c ||
 				p->tos.tlm.d != p->sent_tlm.d ||
 				p->tos.tlm.e != p->sent_tlm.e ||
-				p->tos.tlm.f != p->sent_tlm.f)
+				p->tos.tlm.f != p->sent_tlm.f ||
+				p->tm_reset_pending)
 			{
 				gstate = ensure_pushed(ctx, p);
 				if (p->tos.tlm.a == p->sent_tlm.a &&
@@ -629,7 +657,12 @@ done_SC:
 
 						if (tx == 0 && ty == 0)
 						{
-							/* Nothing to do! */
+							/* The line matrix is unchanged. Normally there is
+							 * nothing to do, but if the text position has been
+							 * moved since (a reset such as "0 0 Td"), we must
+							 * send the reset or following text is misplaced. */
+							if (p->tm_reset_pending && p->super.chain->op_Td)
+								p->super.chain->op_Td(ctx, p->super.chain, 0, 0);
 							goto sorted;
 						}
 						else if (tx == 0 && gstate->sent.text.leading == -ty)
@@ -655,6 +688,7 @@ done_SC:
 sorted:{}
 				p->sent_tlm = p->tos.tlm;
 			}
+			p->tm_reset_pending = 0;
 		}
 	}
 }
@@ -1916,6 +1950,7 @@ pdf_filter_BT(fz_context *ctx, pdf_processor *proc)
 	p->tos.tlm = fz_identity;
 	p->sent_tm = fz_identity;
 	p->sent_tlm = fz_identity;
+	p->tm_reset_pending = 0;
 	p->BT_pending = 1;
 	p->text_sent = 0;
 	p->text_removed = 0;
@@ -2075,9 +2110,12 @@ pdf_filter_Td(fz_context *ctx, pdf_processor *proc, float tx, float ty)
 	if (fz_is_empty_rect(p->gstate->clip_rect))
 		return;
 
+	fz_matrix tm_before = p->tos.tm;
+
 	p->Tm_adjust = 0;
 	filter_flush(ctx, p, FLUSH_OP);
 	pdf_tos_translate(&p->tos, tx, ty);
+	filter_note_text_reset(p, tm_before);
 }
 
 static void
@@ -2101,9 +2139,12 @@ pdf_filter_Tm(fz_context *ctx, pdf_processor *proc, float a, float b, float c, f
 	if (fz_is_empty_rect(p->gstate->clip_rect))
 		return;
 
+	fz_matrix tm_before = p->tos.tm;
+
 	filter_flush(ctx, p, FLUSH_OP);
 	pdf_tos_set_matrix(&p->tos, a, b, c, d, e, f);
 	p->Tm_adjust = 0;
+	filter_note_text_reset(p, tm_before);
 }
 
 static void
@@ -2114,9 +2155,12 @@ pdf_filter_Tstar(fz_context *ctx, pdf_processor *proc)
 	if (fz_is_empty_rect(p->gstate->clip_rect))
 		return;
 
+	fz_matrix tm_before = p->tos.tm;
+
 	filter_flush(ctx, p, FLUSH_OP);
 	p->Tm_adjust = 0;
 	pdf_tos_newline(&p->tos, p->gstate->leading);
+	filter_note_text_reset(p, tm_before);
 }
 
 /* text showing */
@@ -2156,7 +2200,9 @@ pdf_filter_squote(fz_context *ctx, pdf_processor *proc, char *str, size_t len)
 	p->Tm_adjust = 0;
 	filter_flush(ctx, p, FLUSH_ALL);
 
+	fz_matrix tm_before = p->tos.tm;
 	pdf_tos_newline(&p->tos, p->gstate->pending.text.leading);
+	filter_note_text_reset(p, tm_before);
 	filter_show_string(ctx, p, (unsigned char *)str, len);
 }
 
@@ -2176,7 +2222,9 @@ pdf_filter_dquote(fz_context *ctx, pdf_processor *proc, float aw, float ac, char
 
 	p->gstate->pending.text.word_space = aw;
 	p->gstate->pending.text.char_space = ac;
+	fz_matrix tm_before = p->tos.tm;
 	pdf_tos_newline(&p->tos, p->gstate->pending.text.leading);
+	filter_note_text_reset(p, tm_before);
 	filter_show_string(ctx, p, (unsigned char*)str, len);
 }
 
