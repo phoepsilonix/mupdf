@@ -24,6 +24,7 @@
 
 #include <string.h>
 #include <math.h>
+#include <float.h>
 
 typedef struct
 {
@@ -979,6 +980,209 @@ fz_process_shade_type7(fz_context *ctx, fz_shade *shade, fz_matrix ctm, fz_mesh_
 	}
 }
 
+/*
+ * Flat colour fallback for linear/radial shadings whose matrix is so large
+ * that the float32 mesh cannot represent them.
+ *
+ * Some producers write a shading pattern /Matrix whose elements have
+ * saturated to int64 (about 9.2e18). The extension parts of linear and
+ * radial shadings are drawn as huge triangles/annuli (HUGENUM times the
+ * radius) and with such a matrix their vertices reach 1e23. The float
+ * arithmetic in the triangle rasteriser then breaks down and nothing is
+ * painted, while viewers that work in double paint the extended end colour.
+ *
+ * When the matrix is huge, the region to paint (the scissor) covers only a
+ * tiny part of the shading space, so the colour is practically constant
+ * there. Evaluate the shading parameter t in double precision at the
+ * scissor corners and centre, and if all samples agree, paint the scissor
+ * with that single colour (or paint nothing if the region is outside the
+ * shading and it is not extended). Anything not clearly flat falls through
+ * to the normal mesh path, which is therefore unchanged for ordinary files.
+ */
+#define FZ_SHADE_FLAT_MATRIX_LIMIT	1e5	/* only consider matrices larger than this */
+#define FZ_SHADE_FLAT_EXTENT_RATIO	1e-3	/* region size / shading feature size */
+#define FZ_SHADE_FLAT_T_SPREAD		2e-3	/* max variation of t over the region */
+
+/* Parameter t of an axial shading at (x, y). Returns 0 if undefined there. */
+static int
+shade_axial_t(const fz_shade *shade, double x, double y, double *t)
+{
+	double x0 = shade->u.l_or_r.coords[0][0];
+	double y0 = shade->u.l_or_r.coords[0][1];
+	double dx = (double)shade->u.l_or_r.coords[1][0] - x0;
+	double dy = (double)shade->u.l_or_r.coords[1][1] - y0;
+	double dd = dx * dx + dy * dy;
+	double s;
+
+	if (dd <= 0)
+		return 0;
+	s = ((x - x0) * dx + (y - y0) * dy) / dd;
+	if (s < 0)
+	{
+		if (!shade->u.l_or_r.extend[0])
+			return 0;
+		s = 0;
+	}
+	else if (s > 1)
+	{
+		if (!shade->u.l_or_r.extend[1])
+			return 0;
+		s = 1;
+	}
+	*t = s;
+	return 1;
+}
+
+/* Parameter t of a radial shading at (x, y): the largest s for which the
+ * circle at s passes through the point (ISO 32000, 8.7.4.5.4). */
+static int
+shade_radial_t(const fz_shade *shade, double x, double y, double *t)
+{
+	double x0 = shade->u.l_or_r.coords[0][0];
+	double y0 = shade->u.l_or_r.coords[0][1];
+	double r0 = shade->u.l_or_r.coords[0][2];
+	double cdx = (double)shade->u.l_or_r.coords[1][0] - x0;
+	double cdy = (double)shade->u.l_or_r.coords[1][1] - y0;
+	double dr = (double)shade->u.l_or_r.coords[1][2] - r0;
+	double pdx = x - x0;
+	double pdy = y - y0;
+	double a = cdx * cdx + cdy * cdy - dr * dr;
+	double b = pdx * cdx + pdy * cdy + r0 * dr;
+	double c = pdx * pdx + pdy * pdy - r0 * r0;
+	double scale = cdx * cdx + cdy * cdy + dr * dr;
+	double cand[2];
+	int n = 0, i, found = 0;
+	double best = 0;
+
+	if (fabs(a) <= 1e-12 * scale)
+	{
+		if (b == 0)
+			return 0;
+		cand[n++] = c / (2 * b);
+	}
+	else
+	{
+		double disc = b * b - a * c;
+		if (disc < 0)
+			return 0;
+		disc = sqrt(disc);
+		cand[n++] = (b + disc) / a;
+		cand[n++] = (b - disc) / a;
+	}
+
+	for (i = 0; i < n; i++)
+	{
+		double s = cand[i];
+		if (!isfinite(s) || r0 + s * dr < 0)
+			continue;
+		if (s < 0 && !shade->u.l_or_r.extend[0])
+			continue;
+		if (s > 1 && !shade->u.l_or_r.extend[1])
+			continue;
+		if (!found || s > best)
+		{
+			best = s;
+			found = 1;
+		}
+	}
+	if (!found)
+		return 0;
+	*t = best < 0 ? 0 : best > 1 ? 1 : best;
+	return 1;
+}
+
+/* Returns 1 if the shading is flat over the scissor. *paint is then set to
+ * 1 with the parameter in *t, or to 0 if nothing is to be painted. */
+static int
+shade_flat_over_scissor(const fz_shade *shade, fz_matrix ctm, fz_rect scissor, float *t, int *paint)
+{
+	double a = ctm.a, b = ctm.b, c = ctm.c, d = ctm.d, e = ctm.e, f = ctm.f;
+	double mx, det;
+	double px[5], py[5];
+	double minx = DBL_MAX, maxx = -DBL_MAX, miny = DBL_MAX, maxy = -DBL_MAX;
+	double feature, extent;
+	double tmin = DBL_MAX, tmax = -DBL_MAX, tsum = 0;
+	int i, nvalid = 0;
+
+	if (shade->type != FZ_LINEAR && shade->type != FZ_RADIAL)
+		return 0;
+	if (shade->function_stride <= 0)
+		return 0;
+	if (fz_is_infinite_rect(scissor) || fz_is_empty_rect(scissor))
+		return 0;
+
+	mx = fmax(fmax(fabs(a), fabs(b)), fmax(fabs(c), fabs(d)));
+	if (!isfinite(mx) || mx <= FZ_SHADE_FLAT_MATRIX_LIMIT)
+		return 0;
+	det = a * d - b * c;
+	if (!isfinite(det) || fabs(det) < 1e-300)
+		return 0;
+
+	/* Scissor corners and centre, mapped back into shading space (double). */
+	{
+		double sx[5] = { scissor.x0, scissor.x1, scissor.x1, scissor.x0, 0.5 * ((double)scissor.x0 + scissor.x1) };
+		double sy[5] = { scissor.y0, scissor.y0, scissor.y1, scissor.y1, 0.5 * ((double)scissor.y0 + scissor.y1) };
+		for (i = 0; i < 5; i++)
+		{
+			double dx = sx[i] - e;
+			double dy = sy[i] - f;
+			px[i] = (d * dx - c * dy) / det;
+			py[i] = (a * dy - b * dx) / det;
+			if (!isfinite(px[i]) || !isfinite(py[i]))
+				return 0;
+			if (px[i] < minx) minx = px[i];
+			if (px[i] > maxx) maxx = px[i];
+			if (py[i] < miny) miny = py[i];
+			if (py[i] > maxy) maxy = py[i];
+		}
+	}
+
+	/* How large the shading's own features are, to judge "tiny region". */
+	{
+		double dx = (double)shade->u.l_or_r.coords[1][0] - shade->u.l_or_r.coords[0][0];
+		double dy = (double)shade->u.l_or_r.coords[1][1] - shade->u.l_or_r.coords[0][1];
+		feature = sqrt(dx * dx + dy * dy);
+		if (shade->type == FZ_RADIAL)
+		{
+			feature = fmax(feature, fabs((double)shade->u.l_or_r.coords[0][2]));
+			feature = fmax(feature, fabs((double)shade->u.l_or_r.coords[1][2]));
+		}
+	}
+	if (!(feature > 0))
+		return 0;
+	extent = fmax(maxx - minx, maxy - miny);
+	if (extent > feature * FZ_SHADE_FLAT_EXTENT_RATIO)
+		return 0;
+
+	for (i = 0; i < 5; i++)
+	{
+		double ti;
+		int ok = (shade->type == FZ_LINEAR) ?
+			shade_axial_t(shade, px[i], py[i], &ti) :
+			shade_radial_t(shade, px[i], py[i], &ti);
+		if (!ok)
+			continue;
+		nvalid++;
+		tsum += ti;
+		if (ti < tmin) tmin = ti;
+		if (ti > tmax) tmax = ti;
+	}
+
+	if (nvalid == 0)
+	{
+		/* Outside the shading and not extended all over the region. */
+		*paint = 0;
+		return 1;
+	}
+	if (nvalid == 5 && tmax - tmin <= FZ_SHADE_FLAT_T_SPREAD)
+	{
+		*paint = 1;
+		*t = (float)(tsum / 5);
+		return 1;
+	}
+	return 0;
+}
+
 void
 fz_process_shade(fz_context *ctx, fz_shade *shade, fz_matrix ctm, fz_rect scissor,
 		fz_shade_prepare_fn *prepare, fz_shade_process_fn *process, void *process_arg)
@@ -990,6 +1194,32 @@ fz_process_shade(fz_context *ctx, fz_shade *shade, fz_matrix ctm, fz_rect scisso
 	painter.process = process;
 	painter.process_arg = process_arg;
 	painter.ncomp = (shade->function_stride > 0 ? 1 : fz_colorspace_n(ctx, shade->colorspace));
+
+	if (shade->type == FZ_LINEAR || shade->type == FZ_RADIAL)
+	{
+		float t = 0;
+		int paint = 0;
+
+		if (shade_flat_over_scissor(shade, ctm, scissor, &t, &paint))
+		{
+			if (paint)
+			{
+				/* One quad covering the scissor (1 unit larger than it
+				 * so that no edge pixel is missed). */
+				fz_vertex v0, v1, v2, v3;
+				v0.p.x = scissor.x0 - 1; v0.p.y = scissor.y0 - 1;
+				v1.p.x = scissor.x1 + 1; v1.p.y = scissor.y0 - 1;
+				v2.p.x = scissor.x1 + 1; v2.p.y = scissor.y1 + 1;
+				v3.p.x = scissor.x0 - 1; v3.p.y = scissor.y1 + 1;
+				fz_prepare_color(ctx, &painter, &v0, &t);
+				fz_prepare_color(ctx, &painter, &v1, &t);
+				fz_prepare_color(ctx, &painter, &v2, &t);
+				fz_prepare_color(ctx, &painter, &v3, &t);
+				paint_quad(ctx, &painter, &v0, &v1, &v2, &v3);
+			}
+			return;
+		}
+	}
 
 	if (shade->type == FZ_FUNCTION_BASED)
 		fz_process_shade_type1(ctx, shade, ctm, &painter);
